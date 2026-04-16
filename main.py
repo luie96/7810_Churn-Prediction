@@ -54,7 +54,7 @@ def stage_raw_csv_to_inputs(csv_path: str | None) -> Path:
         shutil.copy2(src, dst)
         return dst
 
-    # 默认情况：从 inputs/ 读取
+    # Default: read from inputs/
     candidates = [
         inputs_dir / RAW_CANONICAL_NAME,
         inputs_dir / "Telco-Customer-Churn.csv",

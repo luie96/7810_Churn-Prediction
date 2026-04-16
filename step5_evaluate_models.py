@@ -22,14 +22,17 @@ import seaborn as sns
 from matplotlib import pyplot as plt
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     auc,
     confusion_matrix,
     f1_score,
     precision_score,
+    precision_recall_curve,
     recall_score,
     roc_auc_score,
     roc_curve,
 )
+from sklearn.model_selection import StratifiedKFold, cross_validate
 
 from project_utils import Timer, ensure_output_dirs, get_paths, load_config, setup_logger
 
@@ -61,6 +64,17 @@ def load_test_split(csv_dir: Path) -> tuple[pd.DataFrame, np.ndarray]:
     X_test = pd.read_csv(X_test_path)
     y_test = pd.read_csv(y_test_path)["ChurnLabel"].to_numpy()
     return X_test, y_test
+
+
+def load_train_split(csv_dir: Path) -> tuple[pd.DataFrame, np.ndarray]:
+    """加载训练集（用于 5 折交叉验证的稳定性评估）。"""
+    X_train_path = csv_dir / f"{UPSTREAM_PREFIX}__X_train.csv"
+    y_train_path = csv_dir / f"{UPSTREAM_PREFIX}__y_train.csv"
+    if not X_train_path.exists() or not y_train_path.exists():
+        raise FileNotFoundError("Train split CSV not found. Run step4_train_models.py first.")
+    X_train = pd.read_csv(X_train_path)
+    y_train = pd.read_csv(y_train_path)["ChurnLabel"].to_numpy()
+    return X_train, y_train
 
 
 def load_models(models_dir: Path) -> dict[str, object]:
@@ -136,6 +150,34 @@ def plot_roc(name: str, model: object, X_test: pd.DataFrame, y_test: np.ndarray,
     return out
 
 
+def plot_pr_curve(models: dict[str, object], X_test: pd.DataFrame, y_test: np.ndarray, plots_dir: Path) -> Path:
+    """
+    绘制 PR 曲线（Precision-Recall），并统一保存到：
+    outputs/plots/step5_pr_curve.png
+    """
+
+    fig = plt.figure(figsize=(6.2, 4.6))
+    ax = fig.add_subplot(111)
+
+    for name, model in models.items():
+        scores = predict_score(model, X_test)
+        precision, recall, _ = precision_recall_curve(y_test, scores)
+        ap = average_precision_score(y_test, scores)
+        ax.plot(recall, precision, label=f"{name} (AP={ap:.3f})")
+
+    ax.set_title("Precision-Recall Curve")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.legend(loc="lower left")
+    ax.grid(True, linestyle="--", alpha=0.3)
+
+    out = plots_dir / "step5_pr_curve.png"
+    fig.tight_layout()
+    fig.savefig(out, dpi=180)
+    plt.close(fig)
+    return out
+
+
 def feature_importance(best_model: object, feature_names: list[str]) -> pd.DataFrame:
     if hasattr(best_model, "feature_importances_"):
         imp = np.asarray(best_model.feature_importances_, dtype=float)
@@ -154,6 +196,32 @@ def feature_importance(best_model: object, feature_names: list[str]) -> pd.DataF
     return df
 
 
+def plot_feature_importance_bar(
+    fi_df: pd.DataFrame,
+    plots_dir: Path,
+    top_n: int = 10,
+) -> Path:
+    """
+    生成“流失关键因素”柱状图（Top10），保存到：
+    outputs/plots/step5_feature_importance.png
+    """
+
+    top = fi_df.sort_values("abs_importance", ascending=False).head(top_n).copy()
+    top = top[::-1]  # for horizontal bar ordering
+
+    fig = plt.figure(figsize=(7.2, 4.8))
+    ax = fig.add_subplot(111)
+    ax.barh(top["feature"], top["abs_importance"], color="#2C7FB8")
+    ax.set_title(f"Top {top_n} Churn Drivers (Feature Importance)")
+    ax.set_xlabel("Importance (absolute)")
+    ax.set_ylabel("Feature")
+    fig.tight_layout()
+    out = plots_dir / "step5_feature_importance.png"
+    fig.savefig(out, dpi=180)
+    plt.close(fig)
+    return out
+
+
 def plot_shap_summary(
     best_model_name: str,
     best_model: object,
@@ -169,7 +237,7 @@ def plot_shap_summary(
     - Tree models: TreeExplainer
     - Linear models: LinearExplainer
 
-    Output path (as required): outputs/plots/step5__shap_summary_{best_model_name}.png
+    Output path (tips2): outputs/plots/step5_shap_summary.png
     Returns:
     - plot path (or None if skipped)
     - shap importance dataframe (or None)
@@ -186,7 +254,7 @@ def plot_shap_summary(
         logger.warning("shap is not installed; skipping SHAP analysis.")
         return None, None
 
-    out_path = plots_dir / f"step5__shap_summary_{best_model_name}.png"
+    out_path = plots_dir / "step5_shap_summary.png"
 
     X = X_test.copy()
     if list(X.columns) != feature_names:
@@ -293,6 +361,40 @@ def build_churn_customer_profile_report(
     return out_path
 
 
+def cross_validation_stability(
+    models: dict[str, object],
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    k: int = 5,
+) -> pd.DataFrame:
+    """
+    5 折交叉验证稳定性评估：输出 AUC/F1 的均值与标准差。
+    """
+
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=0)
+    rows = []
+    for name, model in models.items():
+        scores = cross_validate(
+            model,
+            X_train,
+            y_train,
+            cv=cv,
+            scoring={"auc": "roc_auc", "f1": "f1"},
+            n_jobs=None,
+            error_score="raise",
+        )
+        rows.append(
+            {
+                "model": name,
+                "auc_mean": float(np.mean(scores["test_auc"])),
+                "auc_std": float(np.std(scores["test_auc"])),
+                "f1_mean": float(np.mean(scores["test_f1"])),
+                "f1_std": float(np.std(scores["test_f1"])),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("auc_mean", ascending=False).reset_index(drop=True)
+
+
 def main() -> None:
     import argparse
 
@@ -308,9 +410,13 @@ def main() -> None:
         logger = setup_logger(SCRIPT_PREFIX, paths.logs_dir)
 
         timer = Timer()
+        X_train, y_train = load_train_split(paths.csv_dir)
         X_test, y_test = load_test_split(paths.csv_dir)
         models = load_models(paths.models_dir)
-        logger.info(f"Loaded test split and models. X_test_shape={X_test.shape}, elapsed_s={timer.elapsed_s():.3f}")
+        logger.info(
+            f"Loaded train/test splits and models. X_train_shape={X_train.shape}, X_test_shape={X_test.shape}, "
+            f"elapsed_s={timer.elapsed_s():.3f}"
+        )
     except (FileNotFoundError, ValueError) as e:
         msg = f"{type(e).__name__}: {e}"
         print(msg)
@@ -328,6 +434,10 @@ def main() -> None:
         plot_paths.append(str(plot_confusion(name, m, X_test, y_test, paths.plots_dir)))
         plot_paths.append(str(plot_roc(name, m, X_test, y_test, paths.plots_dir)))
 
+    # PR curve (required by tips2)
+    pr_path = plot_pr_curve(models, X_test, y_test, paths.plots_dir)
+    plot_paths.append(str(pr_path))
+
     best_row = metrics_df.sort_values(["auc", "f1"], ascending=False).iloc[0]
     best_name = str(best_row["name"])
     best_model = models[best_name]
@@ -336,6 +446,9 @@ def main() -> None:
     eval_cfg = config.get("evaluation") if isinstance(config.get("evaluation"), dict) else {}
     top_k = int(eval_cfg.get("importance_top_k", 15))
     fi_top = fi_df.head(top_k)
+
+    # Feature importance bar plot (Top10)
+    fi_bar_path = plot_feature_importance_bar(fi_df, paths.plots_dir, top_n=10)
 
     # SHAP analysis (optional, config-controlled)
     shap_plot_path, shap_imp_df = plot_shap_summary(
@@ -359,9 +472,13 @@ def main() -> None:
     metrics_path = paths.csv_dir / f"{SCRIPT_PREFIX}__model_metrics.csv"
     fi_path = paths.csv_dir / f"{SCRIPT_PREFIX}__best_model_feature_importance.csv"
     report_path = paths.reports_dir / f"{SCRIPT_PREFIX}__evaluation_report.txt"
+    report_md_path = paths.reports_dir / "step5_evaluation_report.md"
 
     metrics_df.to_csv(metrics_path, index=False, encoding="utf-8")
     fi_df.to_csv(fi_path, index=False, encoding="utf-8")
+
+    # 5-fold CV stability (required by tips2)
+    cv_df = cross_validation_stability(models, X_train, y_train, k=5)
 
     lines: list[str] = []
     lines.append("Telco Customer Churn - Model Evaluation Report")
@@ -406,14 +523,74 @@ def main() -> None:
 
     report_path.write_text("\n".join(lines), encoding="utf-8", errors="replace")
 
+    # Markdown综合评估报告（tips2要求）
+    md_lines: list[str] = []
+    md_lines.append("# Step5 Model Evaluation Report")
+    md_lines.append("")
+    md_lines.append(f"- Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    md_lines.append(f"- Best model: **{best_name}**")
+    md_lines.append("")
+    md_lines.append("## 1) Metrics (test set)")
+    md_lines.append("")
+    def _safe_markdown(df: pd.DataFrame) -> str:
+        """兼容性：缺少 tabulate 时，降级为纯文本表格。"""
+        try:
+            return df.to_markdown(index=False)
+        except Exception:
+            return "```\n" + df.to_string(index=False) + "\n```"
+
+    md_lines.append(_safe_markdown(metrics_df))
+    md_lines.append("")
+    md_lines.append("## 2) Confusion matrices / ROC / PR")
+    md_lines.append("")
+    md_lines.append("- Confusion matrix and ROC curves are saved per model under `outputs/plots/`.")
+    md_lines.append(f"- PR curve (all models): `{pr_path}`")
+    md_lines.append("")
+    md_lines.append("## 3) Feature importance (Top10)")
+    md_lines.append("")
+    md_lines.append(f"- Bar chart: `{fi_bar_path}`")
+    md_lines.append("")
+    md_lines.append(_safe_markdown(fi_df.sort_values("abs_importance", ascending=False).head(10)))
+    md_lines.append("")
+    md_lines.append("## 4) SHAP explainability")
+    md_lines.append("")
+    if shap_plot_path:
+        md_lines.append(f"- SHAP summary: `{shap_plot_path}`")
+    else:
+        md_lines.append("- SHAP summary: not generated (check logs / environment).")
+    md_lines.append("")
+    md_lines.append("## 5) Model stability (5-fold CV on train split)")
+    md_lines.append("")
+    md_lines.append(_safe_markdown(cv_df))
+    md_lines.append("")
+    md_lines.append("Interpretation example:")
+    if not cv_df.empty:
+        r0 = cv_df.iloc[0]
+        md_lines.append(
+            f"- 5-fold CV AUC mean={r0['auc_mean']:.3f}, std={r0['auc_std']:.3f}; "
+            f"F1 mean={r0['f1_mean']:.3f}, std={r0['f1_std']:.3f}. "
+            "Std close to 0 indicates more stable performance."
+        )
+    md_lines.append("")
+    md_lines.append("## 6) High-risk customer profile")
+    md_lines.append("")
+    if profile_path:
+        md_lines.append(f"- Saved to: `{profile_path}`")
+    else:
+        md_lines.append("- Not generated (check logs).")
+
+    report_md_path.write_text("\n".join(md_lines), encoding="utf-8", errors="replace")
+
     print("=== Evaluation complete ===")
     print(f"Metrics CSV: {metrics_path}")
     print(f"Best-model feature importance CSV: {fi_path}")
     print(f"Evaluation report: {report_path}")
     print(f"Plots saved to: {paths.plots_dir}")
+    print(f"Evaluation report (md): {report_md_path}")
     logger.info(f"Saved metrics: {metrics_path}")
     logger.info(f"Saved feature importance: {fi_path}")
     logger.info(f"Saved evaluation report: {report_path}")
+    logger.info(f"Saved evaluation report (md): {report_md_path}")
     logger.info(f"Saved plots to: {paths.plots_dir}")
 
 

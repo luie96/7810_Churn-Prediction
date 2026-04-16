@@ -10,3 +10,4 @@ shap>=0.46
 featuretools>=1.31
 pytest>=8.0
 setuptools>=65.0
+tabulate>=0.9

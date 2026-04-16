@@ -17,6 +17,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import seaborn as sns
+from matplotlib import pyplot as plt
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 from project_utils import Timer, ensure_output_dirs, get_paths, load_config, setup_logger
@@ -26,11 +28,13 @@ SCRIPT_PREFIX = "step2_preprocess"
 
 
 def resolve_config_path(cli_config: str | None) -> Path:
+    """解析配置文件路径（优先命令行，其次项目根目录 config.yaml）。"""
     base = Path(__file__).resolve().parent
     return Path(cli_config).resolve() if cli_config else (base / "config.yaml")
 
 
 def resolve_dataset_path(inputs_dir: Path, config: dict, cli_path: str | None) -> Path:
+    """解析原始数据 CSV 路径（按 inputs/ 约定 + config.yaml 候选文件名）。"""
     candidates: list[Path] = []
     if cli_path:
         candidates.append(Path(cli_path))
@@ -55,9 +59,11 @@ def resolve_dataset_path(inputs_dir: Path, config: dict, cli_path: str | None) -
 
 
 def safe_to_numeric_totalcharges(s: pd.Series) -> pd.Series:
+    """将 TotalCharges 从字符串安全转为数值；空白字符串转为 NaN。"""
     return pd.to_numeric(s.astype(str).str.strip().replace({"": np.nan}), errors="coerce")
 
 def validate_required_columns(df: pd.DataFrame, config: dict) -> None:
+    """校验输入数据是否包含必要列；缺列直接终止并提示。"""
     data_cfg = config.get("data") if isinstance(config.get("data"), dict) else {}
     required = data_cfg.get("required_columns", []) if isinstance(data_cfg, dict) else []
     if not required:
@@ -67,7 +73,57 @@ def validate_required_columns(df: pd.DataFrame, config: dict) -> None:
         raise ValueError(f"Input CSV is missing required columns: {missing}")
 
 
-def clean_dataset(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+def compute_missing_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    统计各字段缺失值数量与占比（用于透明化预处理报告）。
+    返回包含 columns: missing_count, missing_ratio
+    """
+
+    missing_count = df.isna().sum()
+    missing_ratio = (missing_count / len(df)).replace([np.inf, -np.inf], np.nan)
+    out = pd.DataFrame({"missing_count": missing_count, "missing_ratio": missing_ratio}).sort_values(
+        "missing_count", ascending=False
+    )
+    return out
+
+
+def compute_outlier_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    统计明显异常值（当前规则：负数 tenure / MonthlyCharges / TotalCharges）。
+    返回包含 columns: outlier_count, outlier_ratio
+    """
+
+    rules: dict[str, pd.Series] = {}
+    if "tenure" in df.columns:
+        rules["tenure"] = pd.to_numeric(df["tenure"], errors="coerce") < 0
+    if "MonthlyCharges" in df.columns:
+        rules["MonthlyCharges"] = pd.to_numeric(df["MonthlyCharges"], errors="coerce") < 0
+    if "TotalCharges" in df.columns:
+        rules["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce") < 0
+
+    if not rules:
+        return pd.DataFrame(columns=["outlier_count", "outlier_ratio"])
+
+    outlier_count = {k: int(v.sum()) for k, v in rules.items()}
+    outlier_ratio = {k: (outlier_count[k] / len(df)) for k in rules}
+    return pd.DataFrame({"outlier_count": outlier_count, "outlier_ratio": outlier_ratio}).sort_values(
+        "outlier_count", ascending=False
+    )
+
+
+def clean_dataset(df_raw: pd.DataFrame, totalcharges_fill_strategy: str = "median") -> tuple[pd.DataFrame, list[str]]:
+    """
+    清洗原始表（去重、类型修正、缺失/异常处理、标签编码）。
+
+    参数
+    - df_raw: 原始数据
+    - totalcharges_fill_strategy: TotalCharges 缺失值填充策略（median/mean/0）
+
+    返回
+    - df_clean: 清洗后的数据
+    - steps: 用于报告的步骤摘要列表
+    """
+
     steps: list[str] = []
     df = df_raw.copy()
 
@@ -100,12 +156,21 @@ def clean_dataset(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
             df.loc[m, "TotalCharges"] = 0.0
             steps.append(f"Fill TotalCharges=0 when tenure=0 and TotalCharges missing: filled {filled} rows.")
 
-        # Remaining missing: fill with median (robust; keeps linear models stable).
+        # Remaining missing: configurable fill strategy (median/mean/0)
         remaining = int(df["TotalCharges"].isna().sum())
         if remaining > 0:
-            med = float(df["TotalCharges"].median(skipna=True))
-            df["TotalCharges"] = df["TotalCharges"].fillna(med)
-            steps.append(f"Fill remaining TotalCharges missing with median: missing={remaining}, median={med:.4f}.")
+            strategy = str(totalcharges_fill_strategy).lower()
+            if strategy == "mean":
+                v = float(df["TotalCharges"].mean(skipna=True))
+                df["TotalCharges"] = df["TotalCharges"].fillna(v)
+                steps.append(f"Fill remaining TotalCharges missing with mean: missing={remaining}, mean={v:.4f}.")
+            elif strategy == "0":
+                df["TotalCharges"] = df["TotalCharges"].fillna(0.0)
+                steps.append(f"Fill remaining TotalCharges missing with 0: missing={remaining}.")
+            else:
+                v = float(df["TotalCharges"].median(skipna=True))
+                df["TotalCharges"] = df["TotalCharges"].fillna(v)
+                steps.append(f"Fill remaining TotalCharges missing with median: missing={remaining}, median={v:.4f}.")
 
     # 3) SeniorCitizen: normalize 0/1 -> Yes/No (clearer for one-hot later).
     if "SeniorCitizen" in df.columns:
@@ -373,12 +438,118 @@ def save_artifacts(
     return cleaned_path, model_ready_path, steps_path
 
 
+def plot_numeric_histograms(df: pd.DataFrame, plots_dir: Path) -> list[Path]:
+    """
+    生成数值特征直方图（tenure / MonthlyCharges / TotalCharges）。
+    输出到 outputs/plots/，命名如：step2_tenure_hist.png
+    """
+
+    plots: list[Path] = []
+    for col in ["tenure", "MonthlyCharges", "TotalCharges"]:
+        if col not in df.columns:
+            continue
+        fig = plt.figure(figsize=(6.2, 4.2))
+        ax = fig.add_subplot(111)
+        sns.histplot(pd.to_numeric(df[col], errors="coerce"), bins=30, kde=True, ax=ax)
+        ax.set_title(f"{col} distribution")
+        ax.set_xlabel(col)
+        ax.set_ylabel("Count")
+        out = plots_dir / f"step2_{col}_hist.png"
+        fig.tight_layout()
+        fig.savefig(out, dpi=180)
+        plt.close(fig)
+        plots.append(out)
+    return plots
+
+
+def plot_categorical_pies(df: pd.DataFrame, plots_dir: Path, cols: list[str]) -> list[Path]:
+    """
+    生成类别特征饼图（如 Gender/Contract/PaymentMethod 等）。
+    输出到 outputs/plots/，命名如：step2_Contract_pie.png
+    """
+
+    plots: list[Path] = []
+    for col in cols:
+        if col not in df.columns:
+            continue
+        vc = df[col].astype(str).value_counts(dropna=False)
+        fig = plt.figure(figsize=(6.2, 4.6))
+        ax = fig.add_subplot(111)
+        ax.pie(vc.values, labels=vc.index.tolist(), autopct="%1.1f%%", startangle=90)
+        ax.set_title(f"{col} distribution")
+        out = plots_dir / f"step2_{col}_pie.png"
+        fig.tight_layout()
+        fig.savefig(out, dpi=180)
+        plt.close(fig)
+        plots.append(out)
+    return plots
+
+
+def write_preprocess_report_md(
+    report_path: Path,
+    raw_shape: tuple[int, int],
+    clean_shape: tuple[int, int],
+    missing_stats: pd.DataFrame,
+    outlier_stats: pd.DataFrame,
+    steps: list[str],
+    totalcharges_fill_strategy: str,
+) -> None:
+    """
+    生成《数据预处理报告》Markdown：
+    - 缺失值统计
+    - 异常值统计
+    - 编码/清洗规则说明
+    - 清洗前后维度对比
+    """
+
+    lines: list[str] = []
+    lines.append("# Step2 Preprocess Report")
+    lines.append("")
+    lines.append(f"- Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"- TotalCharges fill strategy: `{totalcharges_fill_strategy}`")
+    lines.append("")
+    lines.append("## Dataset shape comparison")
+    lines.append(f"- Raw shape: {raw_shape}")
+    lines.append(f"- Clean shape: {clean_shape}")
+    lines.append("")
+    lines.append("## Missing values (raw)")
+    lines.append("")
+    def _safe_markdown(df: pd.DataFrame) -> str:
+        """兼容性：缺少 tabulate 时，降级为纯文本表格。"""
+        try:
+            return df.to_markdown()
+        except Exception:
+            return "```\n" + df.to_string() + "\n```"
+
+    lines.append(_safe_markdown(missing_stats))
+    lines.append("")
+    lines.append("## Outliers / invalid values (raw)")
+    lines.append("")
+    if outlier_stats.empty:
+        lines.append("No outlier rules applied.")
+    else:
+        lines.append(_safe_markdown(outlier_stats))
+    lines.append("")
+    lines.append("## Key encoding rules")
+    lines.append("- `SeniorCitizen`: 0/1 -> Yes/No")
+    lines.append("- `Churn`: Yes/No -> `ChurnLabel` (1/0)")
+    lines.append("")
+    lines.append("## Cleaning steps summary")
+    lines.append("")
+    for s in steps:
+        lines.append(f"- {s}")
+    lines.append("")
+
+    report_path.write_text("\n".join(lines), encoding="utf-8", errors="replace")
+
+
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Telco churn - preprocessing")
     parser.add_argument("--csv", type=str, default=None, help="Raw Telco churn CSV path (optional override)")
     parser.add_argument("--config", type=str, default=None, help="Path to config.yaml (optional)")
+    parser.add_argument("--fill-strategy", type=str, default=None, help="TotalCharges missing fill strategy: median|mean|0 (default: median)")
     args = parser.parse_args()
 
     try:
@@ -395,7 +566,19 @@ def main() -> None:
         validate_required_columns(df_raw, config)
         logger.info(f"Raw dataset loaded. rows={len(df_raw)}, cols={df_raw.shape[1]}, elapsed_s={timer.elapsed_s():.3f}")
 
-        df_clean, steps = clean_dataset(df_raw)
+        # TotalCharges 缺失值填充策略支持配置/命令行覆盖（提高透明度与可复现性）
+        default_fill = (
+            (config.get("preprocess") or {}).get("fill_missing", {}).get("numeric", "median")
+            if isinstance(config.get("preprocess"), dict)
+            else "median"
+        )
+        totalcharges_fill_strategy = str(args.fill_strategy or default_fill).lower()
+
+        raw_shape = df_raw.shape
+        missing_stats = compute_missing_stats(df_raw)
+        outlier_stats = compute_outlier_stats(df_raw)
+
+        df_clean, steps = clean_dataset(df_raw, totalcharges_fill_strategy=totalcharges_fill_strategy)
         df_model_ready, preprocess_meta = build_model_ready_dataset(df_clean, config)
         cleaned_path, model_ready_path, steps_path = save_artifacts(
             paths.csv_dir,
@@ -406,14 +589,32 @@ def main() -> None:
             preprocess_meta,
         )
 
+        # 预处理报告（Markdown）
+        report_md_path = paths.reports_dir / "step2_preprocess_report.md"
+        write_preprocess_report_md(
+            report_md_path,
+            raw_shape=raw_shape,
+            clean_shape=df_clean.shape,
+            missing_stats=missing_stats,
+            outlier_stats=outlier_stats,
+            steps=steps,
+            totalcharges_fill_strategy=totalcharges_fill_strategy,
+        )
+
+        # 可视化输出（直方图 + 饼图）
+        plot_numeric_histograms(df_clean, paths.plots_dir)
+        plot_categorical_pies(df_clean, paths.plots_dir, cols=["gender", "Contract", "PaymentMethod", "InternetService"])
+
         logger.info(f"Saved cleaned dataset: {cleaned_path}")
         logger.info(f"Saved model-ready dataset: {model_ready_path}")
         logger.info(f"Saved steps summary: {steps_path}")
+        logger.info(f"Saved preprocess report (md): {report_md_path}")
 
         print("=== Preprocessing complete ===")
         print(f"Saved cleaned dataset: {cleaned_path}")
         print(f"Saved model-ready dataset: {model_ready_path}")
         print(f"Saved steps summary: {steps_path}")
+        print(f"Saved preprocess report (md): {report_md_path}")
         print()
         print("Steps (copy/paste into report):")
         for s in steps:

@@ -7,13 +7,13 @@ It is designed for:
 - **Technical**: build multiple baseline models and evaluate them consistently.
 - **Engineering**: reproducible runs via `config.yaml`, structured outputs, logging, and automated tests.
 
-## 环境准备
+## Setup
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-## 数据文件
+## Dataset
 
 Put the raw dataset under the project root `inputs/` folder (recommended filename: `WA_Fn-UseC_-Telco-Customer-Churn.csv`).
 If your file is elsewhere, you can run `python main.py --csv "path\\to\\csv"` and it will be copied into `inputs/`.
@@ -54,6 +54,28 @@ All key parameters are centralized in `config.yaml`:
 
 Additional outputs:
 - `outputs/logs/`: step logs (`<script>_YYYYMMDD.log`)
+
+## Output files guide (what to look at)
+
+### `outputs/csv/`
+- `step2_preprocess__telco_cleaned.csv`: cleaned table (types fixed, `ChurnLabel` added)
+- `step2__model_ready_dataset.csv`: model-ready dataset after encoding/scaling (features + `ChurnLabel`)
+- `step3__engineered_features.csv`: engineered/selected features (features + `ChurnLabel`)
+- `step5_evaluate_models__model_metrics.csv`: metrics table per model on the test split
+- `step5_evaluate_models__best_model_feature_importance.csv`: feature importance table for the selected best model
+
+### `outputs/reports/`
+- `step1__auto_eda_report.html`: automated EDA report (uses `ydata-profiling` when available; otherwise a fallback HTML)
+- `step2_preprocess_report.md`: preprocessing transparency report (missing/outliers/shape changes/strategy used)
+- `step5_evaluation_report.md`: comprehensive evaluation report (metrics + ROC/PR + stability + explainability)
+- `step5__churn_customer_profile.txt`: segment-based churn profile with numeric support
+
+### `outputs/plots/`
+- `step2_<feature>_hist.png`: histograms for numeric features (`tenure`, `MonthlyCharges`, `TotalCharges`)
+- `step2_<feature>_pie.png`: pie charts for categorical distributions (e.g., `Contract`, `PaymentMethod`)
+- `step5_pr_curve.png`: PR curve comparing all models
+- `step5_feature_importance.png`: Top10 churn drivers bar chart
+- `step5_shap_summary.png`: SHAP summary plot for the best model
 
 ## Data dictionary (Telco churn common fields)
 
@@ -137,4 +159,15 @@ Run all tests:
 ```bash
 python -m pytest -q
 ```
+
+## Example results (illustration)
+
+After running `python main.py`, check `outputs/reports/step5_evaluation_report.md` for the latest metrics.
+For example, a typical run might show something like:
+- AUC ≈ 0.82–0.86
+- F1 ≈ 0.52–0.65
+
+And the key plots include:
+- Confusion matrices and ROC curves under `outputs/plots/`
+- `step5_pr_curve.png` (PR curve)
 
