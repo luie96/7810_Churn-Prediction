@@ -18,6 +18,7 @@ from pathlib import Path
 
 
 RAW_CANONICAL_NAME = "WA_Fn-UseC_-Telco-Customer-Churn.csv"
+DEFAULT_CONFIG_NAME = "config.yaml"
 
 
 def project_root() -> Path:
@@ -79,23 +80,36 @@ def run_step(script_name: str) -> None:
     subprocess.run([sys.executable, str(script_path)], check=True)
 
 
+def run_step_with_config(script_name: str, config_path: Path) -> None:
+    script_path = project_root() / script_name
+    if not script_path.exists():
+        raise FileNotFoundError(f"Script not found: {script_path}")
+    print(f"\n>>> Running: {script_name}")
+    subprocess.run([sys.executable, str(script_path), "--config", str(config_path)], check=True)
+
+
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Telco churn - main pipeline runner")
     parser.add_argument("--csv", type=str, default=None, help="Raw Telco churn CSV path (will be copied into inputs/)")
+    parser.add_argument("--config", type=str, default=None, help="Path to config.yaml (optional)")
     args = parser.parse_args()
 
     ensure_outputs_dir()
     staged = stage_raw_csv_to_inputs(args.csv)
     print(f"Raw dataset ready: {staged}")
 
+    config_path = Path(args.config).resolve() if args.config else (project_root() / DEFAULT_CONFIG_NAME)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
     # Fixed order (aligned to the 5-step pipeline)
-    run_step("step1_data_exploration.py")
-    run_step("step2_preprocess.py")
-    run_step("step3_feature_engineering.py")
-    run_step("step4_train_models.py")
-    run_step("step5_evaluate_models.py")
+    run_step_with_config("step1_data_exploration.py", config_path)
+    run_step_with_config("step2_preprocess.py", config_path)
+    run_step_with_config("step3_feature_engineering.py", config_path)
+    run_step_with_config("step4_train_models.py", config_path)
+    run_step_with_config("step5_evaluate_models.py", config_path)
 
     print("\nPipeline finished. Outputs directory:")
     print(f"- {project_root() / 'outputs'}")

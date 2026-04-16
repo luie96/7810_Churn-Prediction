@@ -1,0 +1,88 @@
+paths:
+  inputs_dir: inputs
+  outputs_dir: outputs
+  csv_dir: outputs/csv
+  reports_dir: outputs/reports
+  plots_dir: outputs/plots
+  models_dir: outputs/models
+  logs_dir: outputs/logs
+
+data:
+  raw_candidates:
+    - WA_Fn-UseC_-Telco-Customer-Churn.csv
+    - Telco-Customer-Churn.csv
+  required_columns:
+    - customerID
+    - gender
+    - SeniorCitizen
+    - Partner
+    - Dependents
+    - tenure
+    - PhoneService
+    - MultipleLines
+    - InternetService
+    - OnlineSecurity
+    - OnlineBackup
+    - DeviceProtection
+    - TechSupport
+    - StreamingTV
+    - StreamingMovies
+    - Contract
+    - PaperlessBilling
+    - PaymentMethod
+    - MonthlyCharges
+    - TotalCharges
+    - Churn
+
+preprocess:
+  # Missing value strategy
+  fill_missing:
+    enabled: true
+    numeric: median
+    categorical: mode
+
+  # Encoding strategy
+  encoding:
+    high_freq_threshold: 0.05  # >5% -> one-hot, otherwise target encoding
+    target_encoding_smoothing: 10.0
+
+  # Scaling strategy for numeric features
+  scaling:
+    enabled: true
+    method: standard  # standard|minmax
+
+feature_engineering:
+  featuretools:
+    enabled: true
+    max_depth: 1
+    # A small set of safe transformation primitives for a single-table dataset
+    trans_primitives:
+      - multiply_numeric
+      - divide_numeric
+      - add_numeric
+      - subtract_numeric
+  selection:
+    method: selectkbest  # selectkbest|pca|none
+    k_best: 40
+    pca_components: 20
+
+training:
+  random_state: 42
+  test_size: 0.3
+  models:
+    logistic_regression:
+      max_iter: 2000
+      solver: lbfgs
+    decision_tree:
+      max_depth: null
+      min_samples_split: 2
+      min_samples_leaf: 1
+    random_forest:
+      n_estimators: 400
+      n_jobs: -1
+
+evaluation:
+  importance_top_k: 15
+  shap:
+    enabled: true
+    max_background_samples: 200

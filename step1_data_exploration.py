@@ -20,24 +20,18 @@ from typing import Dict, Tuple
 import numpy as np
 import pandas as pd
 
+from project_utils import Timer, ensure_output_dirs, get_paths, load_config, setup_logger
+
 
 SCRIPT_PREFIX = "step1_data_exploration"
 
 
-def ensure_dirs() -> dict[str, Path]:
+def resolve_config_path(cli_config: str | None) -> Path:
     base = Path(__file__).resolve().parent
-    inputs = base / "inputs"
-    outputs = base / "outputs"
-    csv_dir = outputs / "csv"
-    reports_dir = outputs / "reports"
-
-    outputs.mkdir(parents=True, exist_ok=True)
-    csv_dir.mkdir(parents=True, exist_ok=True)
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    return {"base": base, "inputs": inputs, "outputs": outputs, "csv": csv_dir, "reports": reports_dir}
+    return Path(cli_config).resolve() if cli_config else (base / "config.yaml")
 
 
-def resolve_dataset_path(inputs_dir: Path, cli_path: str | None) -> Path:
+def resolve_dataset_path(inputs_dir: Path, config: dict, cli_path: str | None) -> Path:
     """
     Project convention: raw data is loaded from the inputs/ folder.
     - If --csv is provided, use it as an explicit override.
@@ -48,12 +42,12 @@ def resolve_dataset_path(inputs_dir: Path, cli_path: str | None) -> Path:
     if cli_path:
         candidates.append(Path(cli_path))
 
-    candidates.extend(
-        [
-            inputs_dir / "WA_Fn-UseC_-Telco-Customer-Churn.csv",
-            inputs_dir / "Telco-Customer-Churn.csv",
-        ]
-    )
+    raw_candidates = (config.get("data") or {}).get("raw_candidates", []) if isinstance(config.get("data"), dict) else []
+    if not isinstance(raw_candidates, list):
+        raw_candidates = []
+    if not raw_candidates:
+        raw_candidates = ["WA_Fn-UseC_-Telco-Customer-Churn.csv", "Telco-Customer-Churn.csv"]
+    candidates.extend([inputs_dir / str(name) for name in raw_candidates])
 
     for p in candidates:
         if p.exists() and p.is_file():
@@ -96,6 +90,15 @@ def field_dictionary() -> Dict[str, Tuple[str, str]]:
         "TotalCharges": ("Account", "Total charges (often stored as string; may contain blanks)"),
         "Churn": ("Target", "Churn label (Yes/No)"),
     }
+
+def validate_required_columns(df: pd.DataFrame, config: dict) -> None:
+    data_cfg = config.get("data") if isinstance(config.get("data"), dict) else {}
+    required = data_cfg.get("required_columns", []) if isinstance(data_cfg, dict) else []
+    if not required:
+        return
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Input CSV is missing required columns: {missing}")
 
 
 def load_raw_csv(csv_path: Path) -> pd.DataFrame:
@@ -186,11 +189,68 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Telco churn - data exploration")
     parser.add_argument("--csv", type=str, default=None, help="Raw Telco churn CSV path (optional override)")
+    parser.add_argument("--config", type=str, default=None, help="Path to config.yaml (optional)")
     args = parser.parse_args()
 
-    dirs = ensure_dirs()
-    csv_path = resolve_dataset_path(dirs["inputs"], args.csv)
-    df = load_raw_csv(csv_path)
+    try:
+        config_path = resolve_config_path(args.config)
+        config = load_config(config_path)
+        paths = get_paths(config, Path(__file__).resolve().parent)
+        ensure_output_dirs(paths)
+        logger = setup_logger(SCRIPT_PREFIX, paths.logs_dir)
+
+        timer = Timer()
+        csv_path = resolve_dataset_path(paths.inputs_dir, config, args.csv)
+        logger.info(f"Loading dataset: {csv_path}")
+        df = load_raw_csv(csv_path)
+        validate_required_columns(df, config)
+        logger.info(f"Dataset loaded. rows={len(df)}, cols={df.shape[1]}, elapsed_s={timer.elapsed_s():.3f}")
+    except (FileNotFoundError, ValueError) as e:
+        # Friendly errors for common issues
+        msg = f"{type(e).__name__}: {e}"
+        print(msg)
+        raise SystemExit(1)
+    except Exception as e:  # noqa: BLE001
+        msg = f"UnexpectedError({type(e).__name__}): {e}"
+        print(msg)
+        raise SystemExit(1)
+
+    # Optional: automated EDA report (ydata-profiling)
+    auto_eda_path = paths.reports_dir / "step1__auto_eda_report.html"
+    try:
+        from ydata_profiling import ProfileReport  # type: ignore
+
+        logger.info("Generating automated EDA report (ydata-profiling)...")
+        t_eda = Timer()
+        profile = ProfileReport(df, title="Telco Customer Churn - Automated EDA", explorative=True)
+        profile.to_file(str(auto_eda_path))
+        logger.info(f"Saved automated EDA report: {auto_eda_path} (elapsed_s={t_eda.elapsed_s():.3f})")
+        print(f"Saved automated EDA report: {auto_eda_path}")
+    except Exception as e:  # noqa: BLE001
+        # In some environments (e.g., Python 3.13), third-party libs may fail to import due to deprecated pkg_resources.
+        # We still produce an HTML file to satisfy the required artifact path.
+        logger.warning(f"Automated EDA (ydata-profiling) failed: {type(e).__name__}: {e}. Writing fallback HTML report.")
+        try:
+            head_html = df.head(20).to_html(index=False)
+            desc_html = df.describe(include="all").to_html()
+            html = "\n".join(
+                [
+                    "<html><head><meta charset='utf-8'><title>Telco Churn - Auto EDA (Fallback)</title></head><body>",
+                    "<h1>Telco Customer Churn - Auto EDA (Fallback)</h1>",
+                    "<p>This report is a lightweight fallback when ydata-profiling cannot run in the current environment.</p>",
+                    f"<h2>Shape</h2><pre>rows={len(df)}, cols={df.shape[1]}</pre>",
+                    "<h2>Head (first 20 rows)</h2>",
+                    head_html,
+                    "<h2>Describe (pandas)</h2>",
+                    desc_html,
+                    "</body></html>",
+                ]
+            )
+            auto_eda_path.write_text(html, encoding="utf-8", errors="replace")
+            logger.info(f"Saved fallback EDA report: {auto_eda_path}")
+            print(f"Saved fallback EDA report: {auto_eda_path}")
+        except Exception as e2:  # noqa: BLE001
+            logger.warning(f"Fallback EDA HTML generation failed: {type(e2).__name__}: {e2}")
 
     fd = field_dictionary()
     n_rows, n_cols = df.shape
@@ -256,8 +316,9 @@ def main() -> None:
     lines.append(ns.to_string())
     lines.append("")
 
-    report_path = save_report(dirs["reports"], "\n".join(lines))
+    report_path = save_report(paths.reports_dir, "\n".join(lines))
     print(f"Saved report: {report_path}")
+    logger.info(f"Saved report: {report_path}")
 
 
 if __name__ == "__main__":
