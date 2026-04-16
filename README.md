@@ -65,12 +65,13 @@ Additional outputs:
 - `step5_evaluate_models__best_model_feature_importance.csv`: feature importance table for the selected best model
 
 ### `outputs/reports/`
-- `step1__auto_eda_report.html`: automated EDA report (uses `ydata-profiling` when available; otherwise a fallback HTML)
+- `step1_data_exploration__data_exploration_summary.txt`: console-style step1 summary (quick copy/paste)
 - `step2_preprocess_report.md`: preprocessing transparency report (missing/outliers/shape changes/strategy used)
 - `step5_evaluation_report.md`: comprehensive evaluation report (metrics + ROC/PR + stability + explainability)
 - `step5__churn_customer_profile.txt`: segment-based churn profile with numeric support
 
 ### `outputs/plots/`
+- `step1__*.png`: step1 EDA plots (churn + numeric/categorical distributions)
 - `step2_<feature>_hist.png`: histograms for numeric features (`tenure`, `MonthlyCharges`, `TotalCharges`)
 - `step2_<feature>_pie.png`: pie charts for categorical distributions (e.g., `Contract`, `PaymentMethod`)
 - `step5_pr_curve.png`: PR curve comparing all models
@@ -111,7 +112,7 @@ Missing values:
 - **step1_data_exploration.py**
   - Loads raw data from `inputs/`
   - Prints key distributions and data-quality checks
-  - Generates automated EDA HTML report: `outputs/reports/step1__auto_eda_report.html` (via `ydata-profiling`)
+  - Generates EDA plots (PNG) under `outputs/plots/` (prefix `step1__`)
 
 - **step2_preprocess.py**
   - Cleans the raw table (dedup, `TotalCharges` conversion, label encoding)

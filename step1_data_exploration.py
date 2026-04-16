@@ -19,6 +19,8 @@ from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
+import seaborn as sns
+from matplotlib import pyplot as plt
 
 from project_utils import Timer, ensure_output_dirs, get_paths, load_config, setup_logger
 
@@ -90,6 +92,67 @@ def field_dictionary() -> Dict[str, Tuple[str, str]]:
         "TotalCharges": ("Account", "Total charges (often stored as string; may contain blanks)"),
         "Churn": ("Target", "Churn label (Yes/No)"),
     }
+
+
+def save_plots_png_only(
+    plots_dir: Path,
+    report_prefix: str,
+    df: pd.DataFrame,
+    churn_dist: pd.DataFrame,
+    cat_dists: dict[str, pd.DataFrame],
+) -> list[Path]:
+    """
+    Save EDA plots as PNG only under outputs/plots/.
+    """
+
+    out_paths: list[Path] = []
+
+    def save_fig(fig, name: str) -> None:
+        png = plots_dir / f"{report_prefix}__{name}.png"
+        fig.savefig(png, dpi=180)
+        out_paths.append(png)
+
+    # Churn bar chart
+    fig = plt.figure(figsize=(5.6, 4.2))
+    ax = fig.add_subplot(111)
+    churn_dist["count"].plot(kind="bar", ax=ax, color=["#4C78A8", "#F58518"])
+    ax.set_title("Churn distribution (count)")
+    ax.set_xlabel("Churn")
+    ax.set_ylabel("Count")
+    fig.tight_layout()
+    save_fig(fig, "churn_bar")
+    plt.close(fig)
+
+    # Numeric histograms
+    for col in ["tenure", "MonthlyCharges", "TotalCharges"]:
+        if col not in df.columns:
+            continue
+        series = df[col]
+        if col == "TotalCharges":
+            series = pd.to_numeric(series.astype(str).str.strip().replace({"": np.nan}), errors="coerce")
+        fig = plt.figure(figsize=(6.2, 4.2))
+        ax = fig.add_subplot(111)
+        sns.histplot(series, bins=30, kde=True, ax=ax)
+        ax.set_title(f"{col} distribution")
+        ax.set_xlabel(col)
+        ax.set_ylabel("Count")
+        fig.tight_layout()
+        save_fig(fig, f"{col}_hist")
+        plt.close(fig)
+
+    # Categorical bar charts
+    for col, dist in cat_dists.items():
+        fig = plt.figure(figsize=(6.6, 4.2))
+        ax = fig.add_subplot(111)
+        dist["count"].plot(kind="bar", ax=ax, color="#54A24B")
+        ax.set_title(f"{col} distribution (count)")
+        ax.set_xlabel(col)
+        ax.set_ylabel("Count")
+        fig.tight_layout()
+        save_fig(fig, f"{col}_bar")
+        plt.close(fig)
+
+    return out_paths
 
 def validate_required_columns(df: pd.DataFrame, config: dict) -> None:
     data_cfg = config.get("data") if isinstance(config.get("data"), dict) else {}
@@ -215,43 +278,6 @@ def main() -> None:
         print(msg)
         raise SystemExit(1)
 
-    # Optional: automated EDA report (ydata-profiling)
-    auto_eda_path = paths.reports_dir / "step1__auto_eda_report.html"
-    try:
-        from ydata_profiling import ProfileReport  # type: ignore
-
-        logger.info("Generating automated EDA report (ydata-profiling)...")
-        t_eda = Timer()
-        profile = ProfileReport(df, title="Telco Customer Churn - Automated EDA", explorative=True)
-        profile.to_file(str(auto_eda_path))
-        logger.info(f"Saved automated EDA report: {auto_eda_path} (elapsed_s={t_eda.elapsed_s():.3f})")
-        print(f"Saved automated EDA report: {auto_eda_path}")
-    except Exception as e:  # noqa: BLE001
-        # In some environments (e.g., Python 3.13), third-party libs may fail to import due to deprecated pkg_resources.
-        # We still produce an HTML file to satisfy the required artifact path.
-        logger.warning(f"Automated EDA (ydata-profiling) failed: {type(e).__name__}: {e}. Writing fallback HTML report.")
-        try:
-            head_html = df.head(20).to_html(index=False)
-            desc_html = df.describe(include="all").to_html()
-            html = "\n".join(
-                [
-                    "<html><head><meta charset='utf-8'><title>Telco Churn - Auto EDA (Fallback)</title></head><body>",
-                    "<h1>Telco Customer Churn - Auto EDA (Fallback)</h1>",
-                    "<p>This report is a lightweight fallback when ydata-profiling cannot run in the current environment.</p>",
-                    f"<h2>Shape</h2><pre>rows={len(df)}, cols={df.shape[1]}</pre>",
-                    "<h2>Head (first 20 rows)</h2>",
-                    head_html,
-                    "<h2>Describe (pandas)</h2>",
-                    desc_html,
-                    "</body></html>",
-                ]
-            )
-            auto_eda_path.write_text(html, encoding="utf-8", errors="replace")
-            logger.info(f"Saved fallback EDA report: {auto_eda_path}")
-            print(f"Saved fallback EDA report: {auto_eda_path}")
-        except Exception as e2:  # noqa: BLE001
-            logger.warning(f"Fallback EDA HTML generation failed: {type(e2).__name__}: {e2}")
-
     fd = field_dictionary()
     n_rows, n_cols = df.shape
     churn_dist = churn_distribution(df)
@@ -261,6 +287,16 @@ def main() -> None:
 
     dq = data_quality_checks(df)
     ns = numeric_stats(df)
+
+    # Plots (PNG only)
+    plot_paths = save_plots_png_only(
+        plots_dir=paths.plots_dir,
+        report_prefix="step1",
+        df=df,
+        churn_dist=churn_dist,
+        cat_dists=cat_dists,
+    )
+    logger.info(f"Saved step1 plots: {len(plot_paths)} PNG files")
 
     print("=== Dataset overview ===")
     print(f"Dataset path: {csv_path}")
@@ -319,6 +355,7 @@ def main() -> None:
     report_path = save_report(paths.reports_dir, "\n".join(lines))
     print(f"Saved report: {report_path}")
     logger.info(f"Saved report: {report_path}")
+    print(f"Saved EDA plots (PNG) under: {paths.plots_dir}")
 
 
 if __name__ == "__main__":
